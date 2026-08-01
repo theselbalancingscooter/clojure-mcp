@@ -116,10 +116,17 @@
                  (fn [exchange arg-map mono-fill-k]
                    (let [clj-result-k
                          (fn [res-list error?]
+                           ;; Signal the MCP response FIRST so client
+                           ;; latency is unaffected by any downstream
+                           ;; I/O. record-tool-call! is a non-blocking
+                           ;; submit to a bounded serialised writer, so
+                           ;; even without this ordering the disk write
+                           ;; wouldn't block — but ordering makes the
+                           ;; guarantee explicit at the seam.
+                           (mono-fill-k (adapt-results res-list error?))
                            ;; Opt-in training-log emit — no-op unless
                            ;; CLOJURE_MCP_TRAINING_DIR env is set.
-                           (training-log/record-tool-call! name arg-map res-list error?)
-                           (mono-fill-k (adapt-results res-list error?)))]
+                           (training-log/record-tool-call! name arg-map res-list error?))]
                      (tool-fn exchange arg-map clj-result-k))))]
     (McpServerFeatures$AsyncToolSpecification.
      mcp-tool

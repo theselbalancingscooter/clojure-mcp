@@ -7,7 +7,8 @@
             [clojure.string :as string]
             [clojure.java.io :as io]
             [clojure-mcp.training-log :as tl])
-  (:import [java.util UUID]))
+  (:import [java.util UUID]
+           [java.util.concurrent CountDownLatch Executors TimeUnit]))
 
 (defn- fresh-dir []
   (let [d (str (System/getProperty "java.io.tmpdir")
@@ -15,17 +16,25 @@
     (io/make-parents (str d "/x"))
     d))
 
+(defn- drain! []
+  ;; The record path is now async. Tests need to wait for the writer
+  ;; thread to finish before asserting on file contents. Submit a
+  ;; blocking no-op and await it — this guarantees any earlier submit
+  ;; has run because the executor is single-threaded.
+  (let [latch (CountDownLatch. 1)]
+    (.submit @#'tl/writer-executor
+             ^Runnable (fn [] (.countDown latch)))
+    (.await latch 5 TimeUnit/SECONDS)))
+
 (defn- with-training-dir* [dir f]
-  ;; The env-var read at ns-load can't be rebindt from here — instead
-  ;; we rebind the private var directly for the duration of the test.
   (let [original @#'tl/training-dir]
     (try
       (alter-var-root #'tl/training-dir (constantly dir))
       (alter-var-root #'tl/enabled? (constantly (some? dir)))
-      ;; Reset the session-atom so each test starts clean.
       (reset! @#'tl/session-state
               {:session-id nil :turn-index 0 :tools-used #{}
                :started-at nil :turn-count 0})
+      (reset! tl/failure-count 0)
       (f)
       (finally
         (alter-var-root #'tl/training-dir (constantly original))
@@ -47,6 +56,7 @@
   (let [dir (fresh-dir)]
     (with-training-dir dir
       (tl/record-tool-call! "clojure_eval" {:code "(+ 1 2)"} ["3"] false)
+      (drain!)
       (let [lines (list-turn-lines dir)]
         (is (= 1 (count lines)) "one JSONL line per tool call")
         (is (string/includes? (first lines) "\"clojure_eval\""))
@@ -56,15 +66,13 @@
 (deftest no-op-when-disabled-test
   (with-training-dir nil
     (tl/record-tool-call! "clojure_eval" {:code "(+ 1 2)"} ["3"] false)
-    ;; No file to check for — the emit path short-circuits on
-    ;; `enabled?` false. The assertion is simply that the call returned
-    ;; without throwing.
     (is (false? tl/enabled?))))
 
 (deftest error-flag-sets-outcome-error-test
   (let [dir (fresh-dir)]
     (with-training-dir dir
       (tl/record-tool-call! "clojure_eval" {:code "(/ 1 0)"} ["ArithmeticException"] true)
+      (drain!)
       (let [lines (list-turn-lines dir)]
         (is (= 1 (count lines)))
         (is (string/includes? (first lines) "\"outcome\":\"error\""))
@@ -76,6 +84,7 @@
       (dotimes [i 5]
         (tl/record-tool-call! "clojure_eval" {:code (str "(inc " i ")")}
                               [(str (inc i))] false))
+      (drain!)
       (let [lines (list-turn-lines dir)]
         (is (= 5 (count lines)))
         (is (= [0 1 2 3 4]
@@ -84,9 +93,52 @@
                          (Long/parseLong (second m))))
                      lines)))))))
 
+(deftest concurrent-emit-preserves-unique-indexes-test
+  (testing (str "many threads hammering record-tool-call! concurrently must NOT "
+                "produce duplicate turn-indexes — the writer-executor serialises "
+                "reservation + append.")
+    (let [dir (fresh-dir)
+          n 50
+          pool (Executors/newFixedThreadPool 8)]
+      (with-training-dir dir
+        (try
+          (let [futures (mapv (fn [i]
+                                (.submit pool
+                                         ^Callable
+                                         (fn [] (tl/record-tool-call!
+                                                  "clojure_eval"
+                                                  {:code (str "(inc " i ")")}
+                                                  [(str (inc i))] false))))
+                              (range n))]
+            (doseq [f futures] (.get f)))
+          (finally
+            (.shutdown pool)
+            (.awaitTermination pool 5 TimeUnit/SECONDS)))
+        (drain!)
+        (let [lines (list-turn-lines dir)
+              indexes (mapv (fn [line]
+                              (Long/parseLong
+                                (second (re-find #"\"turn-index\":(\d+)" line))))
+                            lines)]
+          (is (= n (count lines))
+              "one line per submitted call")
+          (is (= n (count (distinct indexes)))
+              "no duplicate turn-indexes under concurrent submission")
+          (is (= (set (range n)) (set indexes))
+              "the full 0..N-1 range is present"))))))
+
 (deftest emit-never-throws-on-io-failure-test
-  (testing (str "the emit MUST swallow every exception — a bug in the emit "
-                "path can't be allowed to break the tool call it's observing")
-    (with-training-dir "/proc/1/definitely-not-writable"
-      ;; No exception should propagate.
-      (is (nil? (tl/record-tool-call! "clojure_eval" {} ["ok"] false))))))
+  (testing (str "the emit MUST swallow every expected exception. Portable "
+                "fixture: point CLOJURE_MCP_TRAINING_DIR at a REGULAR FILE "
+                "(not a directory) — subsequent io/make-parents + spit will "
+                "fail with an IOException that the emit path must catch.")
+    (let [tmp (fresh-dir)
+          not-a-dir (str tmp "/regular-file-not-a-dir")
+          _ (spit not-a-dir "seed")]
+      (with-training-dir not-a-dir
+        (is (nil? (tl/record-tool-call! "clojure_eval" {} ["ok"] false)))
+        (drain!)
+        (is (pos? @tl/failure-count)
+            "failure counter must have been bumped by the swallowed exception")
+        (is (empty? (list-turn-lines not-a-dir))
+            "no JSONL file created (write path failed as expected)")))))

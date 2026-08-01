@@ -7,29 +7,38 @@
    `session-<uuid>-turns.jsonl`; a `session-<uuid>-summary.edn`
    snapshots on JVM shutdown.
 
-   The emitted shape mirrors the PRD-09 §2.1/§2.2 schema used by the
-   verity/memory-hawk corpus pipeline (see the ADR link in the PR
-   description). Anyone can point at that pipeline OR any other
-   ingest that reads the same shape.
+   The emitted shape mirrors a schema used by an external training-
+   corpus pipeline for LLM fine-tuning. Anyone can point at that
+   pipeline OR any other ingest that reads the same shape.
 
-   Zero effect on tool behaviour: if the emit throws or the disk is
-   full, the caller sees nothing — WARN goes to the logger and the
-   tool response continues normally. Emit-side failure MUST NOT
-   propagate to the client.
+   Zero effect on tool behaviour:
+   - The MCP response is NOT blocked on emit I/O. The interceptor
+     hands the (name, args, result) triple to a bounded background
+     writer and returns immediately.
+   - Any Exception during emit is caught, WARN-logged, and counted
+     in `failure-count` (public for observability). Fatal JVM errors
+     (Error subclasses like OutOfMemoryError) are deliberately NOT
+     caught — those signal a system-wide problem the tool caller
+     should know about.
+
+   Concurrency:
+   - Turn-index reservation + JSONL append run inside a serialised
+     writer (single-thread executor). Concurrent callbacks reserve
+     unique sequential indexes and their lines land in submission
+     order. Verified by the concurrent-emission test.
 
    Non-goals:
    - No network I/O. The emit writes local files; dispatch to any
      server is a separate concern.
    - No PII scrubbing. Callers should treat the training dir as
-     sensitive (contains file contents + shell arguments).
-   - No hook for tool responses whose bytes reveal secrets — a
-     downstream ingest is expected to redact."
+     sensitive (contains file contents + shell arguments)."
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [taoensso.timbre :as log])
   (:import [java.time Instant]
-           [java.util UUID]))
+           [java.util UUID]
+           [java.util.concurrent Executors ExecutorService TimeUnit]))
 
 (def ^:private training-dir
   (some-> (System/getenv "CLOJURE_MCP_TRAINING_DIR") str/trim not-empty))
@@ -43,6 +52,23 @@
 (defonce ^:private session-state
   (atom {:session-id nil :turn-index 0 :tools-used #{}
          :started-at nil :turn-count 0}))
+
+(defonce ^{:doc "Emit-side failure counter. Bumped once per exception
+  swallowed by the emit path (either the per-turn record or the shutdown
+  summary write). Public so ops can graph 'training-log emit health'
+  without reading logs."}
+  failure-count (atom 0))
+
+;; Single-thread serialised writer. All record + write work runs here;
+;; the caller thread (the MCP tool callback) returns immediately after
+;; submit, so response latency is unaffected by disk I/O.
+(defonce ^:private ^ExecutorService writer-executor
+  (let [thread-factory
+        (reify java.util.concurrent.ThreadFactory
+          (newThread [_ r]
+            (doto (Thread. r "clojure-mcp-training-log")
+              (.setDaemon true))))]
+    (Executors/newSingleThreadExecutor thread-factory)))
 
 (defn- ensure-session! []
   (swap! session-state
@@ -61,43 +87,64 @@
   (io/file training-dir
            (str "session-" (:session-id @session-state) "-summary.edn")))
 
+(defn- record-tool-call-sync!
+  "Runs on the writer-executor thread. Atomic: reserves the next
+   turn-index via `swap-vals!` (returns old + new state in one CAS),
+   builds the line from the reserved index, appends to the JSONL.
+   Single-thread executor means the append order matches the
+   submission order."
+  [tool-name arg-map result-strs error?]
+  (try
+    (ensure-session!)
+    (let [[before after]
+          (swap-vals! session-state
+                      (fn [s] (-> s
+                                  (update :turn-index inc)
+                                  (update :turn-count inc)
+                                  (update :tools-used conj tool-name))))
+          reserved-index (:turn-index before)
+          turn {:session-id     (:session-id after)
+                :turn-index     reserved-index
+                :model          "unknown"
+                :user           nil
+                :reasoning      nil
+                :tool-calls     [{:tool   tool-name
+                                  :input  (or arg-map {})
+                                  :output (apply str result-strs)
+                                  :status (if error? :error :ok)
+                                  :ms     nil}]
+                :outcome        (if error? :error :verified)
+                :evidence-hash  nil
+                :read-only?     false
+                :timestamp      (str (Instant/now))}
+          line (json/write-str turn)]
+      (io/make-parents (turns-path))
+      (spit (turns-path) (str line "\n") :append true))
+    (catch Exception e
+      (swap! failure-count inc)
+      (log/warn "clojure-mcp training emit failed"
+                {:tool tool-name :error (.getMessage e)}))))
+
 (defn record-tool-call!
   "Called from `create-async-tool`'s continuation AFTER the tool_fn's
-   `clj-result-k` fires. Args are captured verbatim from the MCP call;
-   the result is the vector of strings the tool passed to `clj-result-k`.
+   `clj-result-k` fires. Non-blocking: submits the record job to a
+   bounded serialised writer and returns immediately. Callers see no
+   latency from disk I/O and no exception can propagate.
 
-   Never throws — emit failures are logged and swallowed so a training-log
-   bug can never break a tool response."
+   Idempotent for the disabled case — no-op when the env var is unset."
   [tool-name arg-map result-strs error?]
   (when enabled?
     (try
-      (ensure-session!)
-      (let [before  @session-state
-            _       (swap! session-state
-                           (fn [s] (-> s
-                                       (update :turn-index inc)
-                                       (update :turn-count inc)
-                                       (update :tools-used conj tool-name))))
-            turn    {:session-id     (:session-id before)
-                     :turn-index     (:turn-index before)
-                     :model          "unknown"
-                     :user           nil
-                     :reasoning      nil
-                     :tool-calls     [{:tool   tool-name
-                                       :input  (or arg-map {})
-                                       :output (apply str result-strs)
-                                       :status (if error? :error :ok)
-                                       :ms     nil}]
-                     :outcome        (if error? :error :verified)
-                     :evidence-hash  nil
-                     :read-only?     false
-                     :timestamp      (str (Instant/now))}
-            line    (json/write-str turn)]
-        (io/make-parents (turns-path))
-        (spit (turns-path) (str line "\n") :append true))
-      (catch Throwable e
-        (log/warn "clojure-mcp training emit failed"
-                  {:tool tool-name :error (.getMessage e)})))))
+      (.submit writer-executor
+               ^Runnable
+               (fn [] (record-tool-call-sync!
+                        tool-name arg-map result-strs error?)))
+      (catch java.util.concurrent.RejectedExecutionException e
+        ;; Executor is shutting down — count + carry on.
+        (swap! failure-count inc)
+        (log/warn "clojure-mcp training emit rejected (executor closed)"
+                  {:tool tool-name :error (.getMessage e)})))
+    nil))
 
 (defn- write-summary! []
   (when enabled?
@@ -120,10 +167,20 @@
                                      :verity-version  "n/a"
                                      :verity-commit   "n/a"}
                   :quality-hints    {}}))))
-      (catch Throwable e
+      (catch Exception e
+        (swap! failure-count inc)
         (log/warn "clojure-mcp training summary write failed"
                   {:error (.getMessage e)})))))
 
+(defn- flush-and-write-summary! []
+  ;; Drain in-flight writes first so the summary's turn-count matches
+  ;; what actually landed in the JSONL.
+  (try
+    (.shutdown writer-executor)
+    (.awaitTermination writer-executor 5 TimeUnit/SECONDS)
+    (catch InterruptedException _))
+  (write-summary!))
+
 (when enabled?
   (log/info "clojure-mcp training-log enabled" {:dir training-dir})
-  (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable write-summary!)))
+  (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable flush-and-write-summary!)))
