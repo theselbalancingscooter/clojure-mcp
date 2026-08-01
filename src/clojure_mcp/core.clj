@@ -7,7 +7,8 @@
             [clojure-mcp.nrepl :as nrepl]
             [clojure-mcp.config :as config]
             [clojure-mcp.file-content :as file-content]
-            [clojure-mcp.nrepl-launcher :as nrepl-launcher])
+            [clojure-mcp.nrepl-launcher :as nrepl-launcher]
+            [clojure-mcp.training-log :as training-log])
   (:import [io.modelcontextprotocol.server.transport
             StdioServerTransportProvider]
            [io.modelcontextprotocol.server McpServer
@@ -115,6 +116,9 @@
                  (fn [exchange arg-map mono-fill-k]
                    (let [clj-result-k
                          (fn [res-list error?]
+                           ;; Opt-in training-log emit — no-op unless
+                           ;; CLOJURE_MCP_TRAINING_DIR env is set.
+                           (training-log/record-tool-call! name arg-map res-list error?)
                            (mono-fill-k (adapt-results res-list error?)))]
                      (tool-fn exchange arg-map clj-result-k))))]
     (McpServerFeatures$AsyncToolSpecification.

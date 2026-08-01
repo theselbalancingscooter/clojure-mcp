@@ -712,6 +712,37 @@ Configuration is extensively documented [here](doc/CONFIG.md).
 
 **Note**: Configuration is loaded when the MCP server starts. Restart the server (or the Chat Agent) after making configuration changes.
 
+## 📊 Optional: Training-log emit
+
+ClojureMCP can optionally write a per-session JSONL trace of every
+tool call to a local directory. **This is off by default** — set the
+`CLOJURE_MCP_TRAINING_DIR` environment variable to a writable
+directory before starting the server to enable it:
+
+```bash
+export CLOJURE_MCP_TRAINING_DIR="$HOME/.clojure-mcp/training"
+clojure -X:mcp
+```
+
+Each session writes:
+
+- `session-<uuid>-turns.jsonl` — one line per tool call (name, args,
+  result, ok/error, ISO-8601 timestamp)
+- `session-<uuid>-summary.edn` — session-level stats written on JVM
+  shutdown (turn count, tools used, session start/end)
+
+The emitted shape is a subset of a schema used by an external
+training-corpus pipeline for LLM fine-tuning. It is designed so any
+downstream ingest can read the files directly.
+
+**Zero effect on tool behaviour.** The emit runs after the tool has
+already completed. Any exception in the emit path is logged and
+swallowed so a training-log bug cannot break tool responses.
+
+**Files are sensitive.** Traces contain tool arguments (file contents,
+shell commands, eval expressions) and results. Keep the training dir
+on a private disk and treat as you would `.bash_history`.
+
 ## 📝 License
 
 Eclipse Public License - v 2.0
