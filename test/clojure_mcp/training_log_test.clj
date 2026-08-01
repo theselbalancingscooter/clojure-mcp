@@ -26,9 +26,23 @@
              ^Runnable (fn [] (.countDown latch)))
     (.await latch 5 TimeUnit/SECONDS)))
 
+(defn- ensure-writer-executor! []
+  ;; The drain-summary test intentionally shuts the executor down.
+  ;; Rebuild if needed so subsequent tests can submit.
+  (let [ex @#'tl/writer-executor]
+    (when (.isShutdown ex)
+      (alter-var-root #'tl/writer-executor
+                      (fn [_]
+                        (let [tf (reify java.util.concurrent.ThreadFactory
+                                   (newThread [_ r]
+                                     (doto (Thread. r "clojure-mcp-training-log")
+                                       (.setDaemon true))))]
+                          (java.util.concurrent.Executors/newSingleThreadExecutor tf)))))))
+
 (defn- with-training-dir* [dir f]
   (let [original @#'tl/training-dir]
     (try
+      (ensure-writer-executor!)
       (alter-var-root #'tl/training-dir (constantly dir))
       (alter-var-root #'tl/enabled? (constantly (some? dir)))
       (reset! @#'tl/session-state
@@ -126,6 +140,52 @@
               "no duplicate turn-indexes under concurrent submission")
           (is (= (set (range n)) (set indexes))
               "the full 0..N-1 range is present"))))))
+
+(deftest write-failure-does-not-drift-turn-count-test
+  (testing (str "turn-count must reflect ACTUAL writes, not submissions. "
+                "If the write throws, the summary's :turn-count / "
+                ":tool-call-count must stay accurate — otherwise the EDN "
+                "summary and the JSONL disagree on how many turns happened.")
+    (let [tmp (fresh-dir)
+          not-a-dir (str tmp "/regular-file-not-a-dir")
+          _ (spit not-a-dir "seed")]
+      (with-training-dir not-a-dir
+        (tl/record-tool-call! "clojure_eval" {} ["ok"] false)
+        (tl/record-tool-call! "clojure_eval" {} ["ok"] false)
+        (drain!)
+        (let [{:keys [turn-count tools-used]} @@#'tl/session-state]
+          (is (zero? turn-count)
+              "no writes landed -> turn-count must be 0")
+          (is (empty? tools-used)
+              "no writes landed -> tools-used stays empty")
+          (is (= 2 @tl/failure-count)
+              "both submissions bumped the failure counter"))))))
+
+(deftest flush-and-summary-drain-writes-accurate-counts-test
+  (testing (str "the shutdown flush must drain in-flight writes BEFORE "
+                "the summary is written. Regression fixture for the "
+                "'summary reports N while JSONL has M<N' class of bug.")
+    (let [dir (fresh-dir)]
+      (with-training-dir dir
+        (dotimes [i 3]
+          (tl/record-tool-call! "clojure_eval"
+                                {:code (str "(inc " i ")")}
+                                [(str (inc i))]
+                                false))
+        ;; Simulate the JVM shutdown hook path.
+        (@#'tl/flush-and-write-summary!)
+        (let [lines (list-turn-lines dir)
+              summary-file (io/file dir
+                                    (str "session-"
+                                         (:session-id @@#'tl/session-state)
+                                         "-summary.edn"))
+              summary (when (.exists summary-file)
+                        (read-string (slurp summary-file)))]
+          (is (= 3 (count lines)) "all 3 writes landed on disk")
+          (is (some? summary))
+          (is (= 3 (:turn-count summary))
+              "summary :turn-count matches the JSONL line count")
+          (is (= 3 (:tool-call-count summary))))))))
 
 (deftest emit-never-throws-on-io-failure-test
   (testing (str "the emit MUST swallow every expected exception. Portable "

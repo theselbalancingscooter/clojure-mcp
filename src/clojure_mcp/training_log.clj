@@ -13,13 +13,24 @@
 
    Zero effect on tool behaviour:
    - The MCP response is NOT blocked on emit I/O. The interceptor
-     hands the (name, args, result) triple to a bounded background
-     writer and returns immediately.
+     hands the (name, args, result) triple to a SERIALISED background
+     writer (single-thread executor with an unbounded queue) and
+     returns immediately. Unbounded is intentional for this opt-in
+     tool: dropping training records to protect memory is worse than
+     the training records themselves — and the queue can only grow
+     if disk I/O is stalled indefinitely, which is a system-wide
+     problem the operator should already be seeing.
    - Any Exception during emit is caught, WARN-logged, and counted
      in `failure-count` (public for observability). Fatal JVM errors
      (Error subclasses like OutOfMemoryError) are deliberately NOT
      caught — those signal a system-wide problem the tool caller
      should know about.
+   - Turn accounting is TWO-STAGE: the reservation step gives every
+     submitted call a unique sequential `:turn-index` (never
+     collides), but the session-level `:turn-count` only advances on
+     WRITE SUCCESS. The summary's `:tool-call-count` reflects records
+     that actually landed in the JSONL, not records that were
+     submitted-but-failed.
 
    Concurrency:
    - Turn-index reservation + JSONL append run inside a serialised
@@ -88,20 +99,22 @@
            (str "session-" (:session-id @session-state) "-summary.edn")))
 
 (defn- record-tool-call-sync!
-  "Runs on the writer-executor thread. Atomic: reserves the next
-   turn-index via `swap-vals!` (returns old + new state in one CAS),
-   builds the line from the reserved index, appends to the JSONL.
-   Single-thread executor means the append order matches the
-   submission order."
+  "Runs on the writer-executor thread. Two-stage accounting:
+   1. RESERVE: atomically increment `:turn-index` (single CAS via
+      swap-vals!) — every submitted call gets a unique sequential
+      index even if writes race.
+   2. WRITE: build + append the JSONL line. On success, bump
+      `:turn-count` + `:tools-used` so summary counters reflect
+      records that ACTUALLY landed (not just ones that were
+      submitted-but-failed). On failure, `:turn-index` is still
+      consumed (leaves an honest gap that a curator UI can detect)
+      but summary counts stay accurate."
   [tool-name arg-map result-strs error?]
   (try
     (ensure-session!)
     (let [[before after]
           (swap-vals! session-state
-                      (fn [s] (-> s
-                                  (update :turn-index inc)
-                                  (update :turn-count inc)
-                                  (update :tools-used conj tool-name))))
+                      (fn [s] (update s :turn-index inc)))
           reserved-index (:turn-index before)
           turn {:session-id     (:session-id after)
                 :turn-index     reserved-index
@@ -119,7 +132,13 @@
                 :timestamp      (str (Instant/now))}
           line (json/write-str turn)]
       (io/make-parents (turns-path))
-      (spit (turns-path) (str line "\n") :append true))
+      (spit (turns-path) (str line "\n") :append true)
+      ;; Advance the "actually-written" counters AFTER a successful
+      ;; write — summary EDN's counts must not drift from the JSONL.
+      (swap! session-state
+             (fn [s] (-> s
+                         (update :turn-count inc)
+                         (update :tools-used conj tool-name)))))
     (catch Exception e
       (swap! failure-count inc)
       (log/warn "clojure-mcp training emit failed"
@@ -174,11 +193,18 @@
 
 (defn- flush-and-write-summary! []
   ;; Drain in-flight writes first so the summary's turn-count matches
-  ;; what actually landed in the JSONL.
+  ;; what actually landed in the JSONL. Log a warning if drain times
+  ;; out — a discarded false from awaitTermination would let
+  ;; write-summary! run against unsettled state.
   (try
     (.shutdown writer-executor)
-    (.awaitTermination writer-executor 5 TimeUnit/SECONDS)
-    (catch InterruptedException _))
+    (let [drained? (.awaitTermination writer-executor 5 TimeUnit/SECONDS)]
+      (when-not drained?
+        (swap! failure-count inc)
+        (log/warn "clojure-mcp training-log drain timed out — summary counts may lag"
+                  {:pending-tasks-approx "unknown (executor doesn't expose it)"})))
+    (catch InterruptedException _
+      (log/warn "clojure-mcp training-log drain interrupted")))
   (write-summary!))
 
 (when enabled?
